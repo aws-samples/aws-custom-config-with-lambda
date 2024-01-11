@@ -1,0 +1,181 @@
+Parameters:
+  NotificationEmail:
+    Type: String
+Resources:
+  awsconfigdemotopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Email Notification
+      TopicName: aws-config-demo-topic
+  awsconfigdemotopicTokenSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref NotificationEmail
+      Protocol: email
+      TopicArn: !Ref awsconfigdemotopic
+  awsconfigdemolambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - Fn::Join:
+            - ""
+            - - "arn:"
+              - Ref: AWS::Partition
+              - :iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - Fn::Join:
+            - ""
+            - - "arn:"
+              - Ref: AWS::Partition
+              - :iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+  awsconfigdemolambdaServiceRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: sns:Publish
+            Effect: Allow
+            Resource:
+              Ref: awsconfigdemotopic
+        Version: "2012-10-17"
+      PolicyName: awsconfigdemolambdaServiceRoleDefaultPolicy
+      Roles:
+        - !Ref awsconfigdemolambdaServiceRole
+  awsconfigdemolambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          def save_compliance_result(evaluations, token):
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=token,
+                  TestMode=False
+              )
+              logger.info(f"Save evaluation results->{response}")
+
+          def is_applicable(configurationItem, event):
+              status = configurationItem['configurationItemStatus']
+              eventLeftScope = event['eventLeftScope']
+              if status == 'ResourceDeleted':
+                  print("Resource Deleted, setting Compliance Status to NOT_APPLICABLE.")
+              return (status == 'OK' or status == 'ResourceDiscovered') and not eventLeftScope
+
+          def send_notification(resource_id, account_id, rule_name):
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              message_body = f'resource {resource_id} in account {account_id} is not compliant with AWS Config rule of {rule_name}'
+              message_subject = 'AWS Config Rule Notification'
+
+              sns_client = boto3.client('sns')
+              response = sns_client.publish(
+                  TopicArn=topic_arn,
+                  Message=message_body,
+                  Subject=message_subject
+              )
+              message_id = response['MessageId']
+              logger.info(f'SNS topic message is published {message_id}')
+
+          def is_compliant(configurationItem):
+              logger.info(f"Resource to be evaluated->{configurationItem}")
+              if configurationItem['configuration']['dBInstanceClass'] == 'db.t3.micro':
+                  return True
+              else:
+                  return False
+
+          def lambda_handler(event, context):
+              # https://docs.aws.amazon.com/config/latest/developerguide/evaluate-config_develop-rules_python-sample.html#event-based-example-rule
+              logger.info(event)
+
+              invoking_event = json.loads(event['invokingEvent'])
+              configuration_item = invoking_event['configurationItem']
+
+              if not is_applicable(configuration_item, event):
+                  comliant_status = 'NOT_APPLICABLE'
+              elif is_compliant(configuration_item):
+                  comliant_status = 'COMPLIANT'
+              else:
+                  comliant_status = 'NON_COMPLIANT'
+
+              evaluations = [
+                  {
+                      'ComplianceResourceType': configuration_item['resourceType'],
+                      'ComplianceResourceId': configuration_item['resourceId'],
+                      'ComplianceType': comliant_status,
+                      'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
+                  }
+              ]
+              save_compliance_result(evaluations, event['resultToken'])
+
+              if comliant_status == 'NON_COMPLIANT':
+                  send_notification(
+                      resource_id=configuration_item['resourceId'],
+                      account_id=configuration_item['awsAccountId'],
+                      rule_name=event['configRuleName']
+                  )
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN:
+            Ref: awsconfigdemotopic
+      FunctionName: aws-config-demo-lambda
+      Description: This is demo lambda used by AWS Config custom rule to check RDS instance size.
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - awsconfigdemolambdaServiceRole
+          - Arn
+      Runtime: python3.10
+    DependsOn:
+      - awsconfigdemolambdaServiceRoleDefaultPolicy
+      - awsconfigdemolambdaServiceRole
+  awsconfigdemolambdaCustomRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Fn::GetAtt:
+          - awsconfigdemolambda
+          - Arn
+      Principal: config.amazonaws.com
+      SourceAccount:
+        Ref: AWS::AccountId
+  awsconfigdemorule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: aws-config-demo-rule
+      Description: The only RDS instance type allowed in this account is db.t3.micro. This rule is for demo purpose only.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+        SourceIdentifier:
+          Fn::GetAtt:
+            - awsconfigdemolambda
+            - Arn
+    DependsOn:
+      - awsconfigdemolambdaCustomRulePermission
+      - awsconfigdemolambda
+      - awsconfigdemolambdaServiceRoleDefaultPolicy
+      - awsconfigdemolambdaServiceRole
